@@ -1,8 +1,18 @@
 name: Scraper
 on:
   schedule:
-    - cron: '18 4,10,16,22 * * *'
+    - cron: '18 5,10,16 * * *'
   workflow_dispatch:
+
+# Lets the workflow commit fb_posted_saudi_arabia.csv back to the repo
+permissions:
+  contents: write
+
+# Never let two runs post at the same time (would cause duplicate Facebook posts)
+concurrency:
+  group: scraper
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -17,7 +27,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Restore the "already posted" tracker so jobs are NOT re-posted to Facebook every run
       - name: Restore tracker
         uses: actions/cache/restore@v4
         with:
@@ -40,12 +49,14 @@ jobs:
           path: processed_jobs_saudi_arabia.csv
           key: tracker-${{ github.run_id }}
 
-      - name: Upload Excel output as artifact
+      - name: Upload output as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jobs-output-${{ github.run_id }}
+          # globs match both "_saudi_arabia" and "__saudi_arabia" spellings
           path: |
-            jobs_output__saudi_arabia.xlsx
-            processed_jobs__saudi_arabia.csv
+            jobs_output*saudi_arabia.xlsx
+            processed_jobs*saudi_arabia.csv
+          if-no-files-found: ignore
           retention-days: 7
