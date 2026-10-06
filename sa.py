@@ -27,13 +27,22 @@ CSV_SOURCE    = os.environ.get("CSV_SOURCE", "").strip() or DEFAULT_CSV_URL
 CSV_TOKEN     = (os.environ.get("CSV_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")).strip()
 SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "").strip().rstrip("/")
 
-# What has already gone to Facebook. Committed to the repo so it survives between runs.
-STATE_FILE = "fb_posted_saudi_arabia.csv"
-STATE_COLS = ["Job ID", "FB Post ID", "Site Path", "Timestamp"]
+# What has already gone to each platform. Committed to the repo so it survives between runs.
+STATE_FILE    = "fb_posted_saudi_arabia.csv"
+STATE_COLS    = ["Job ID", "FB Post ID", "Site Path", "Timestamp"]
+LI_STATE_FILE = "li_posted_saudi_arabia.csv"
+LI_STATE_COLS = ["Job ID", "LI Post ID", "Site Path", "Timestamp"]
 
+# Facebook
 FB_PAGE_ID     = os.environ.get("FB_PAGE_ID", "").strip()
 FB_PAGE_TOKEN  = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
 FB_API_VERSION = "v21.0"
+
+# LinkedIn (personal profile). LI_AUTHOR_URN looks like: urn:li:person:abc123XYZ
+LI_TOKEN      = os.environ.get("LI_ACCESS_TOKEN", "").strip()
+LI_AUTHOR_URN = os.environ.get("LI_AUTHOR_URN", "").strip()
+LI_ENDPOINT   = "https://api.linkedin.com/v2/ugcPosts"
+
 FB_POST_DELAY_S      = 45
 FB_MAX_POSTS_PER_RUN = int(os.environ.get("FB_MAX_POSTS_PER_RUN", "15") or 15)
 FB_MAX_AGE_DAYS      = int(os.environ.get("FB_MAX_AGE_DAYS", "7") or 7)
@@ -43,7 +52,7 @@ FB_REQUIRE_DETAILS   = os.environ.get("FB_REQUIRE_DETAILS", "1").strip() != "0"
 UA = {"User-Agent": "Mozilla/5.0 (compatible; MimusJobsFBPoster/1.0)"}
 HASHTAGS             = "#SaudiArabia #KSA #Jobs #Hiring #وظائف"
 
-# Commit + push the state file right after every post (GitHub Actions only),
+# Commit + push the state files right after every post (GitHub Actions only),
 # so a cancelled/timed-out run can never cause double-posting.
 GIT_PUSH_STATE = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
@@ -92,24 +101,26 @@ def load_rows() -> list:
     return rows
 
 
-# ── State (what has already gone to Facebook) ────────────────────────────────
-def load_state() -> tuple:
+# ── State (what has already gone to each platform) ───────────────────────────
+def load_state(path: str) -> tuple:
     ids, paths = set(), set()
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, encoding="utf-8", newline="") as f:
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", newline="") as f:
             for r in csv.DictReader(f):
-                ids.add(r.get("Job ID", ""))
-                paths.add(r.get("Site Path", ""))
+                if r.get("Job ID"):
+                    ids.add(r["Job ID"])
+                if r.get("Site Path"):
+                    paths.add(r["Site Path"])
     return ids, paths
 
 
-def save_state(job_id: str, fb_id: str, site_path_: str):
-    new_file = not os.path.exists(STATE_FILE)
-    with open(STATE_FILE, "a", encoding="utf-8", newline="") as f:
+def save_state(path: str, cols: list, job_id: str, post_id: str, site_path_: str):
+    new_file = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         if new_file:
-            w.writerow(STATE_COLS)
-        w.writerow([job_id, fb_id, site_path_, datetime.now().isoformat()])
+            w.writerow(cols)
+        w.writerow([job_id, post_id, site_path_, datetime.now().isoformat()])
 
 
 def _git(*args, timeout: int = 60):
@@ -117,13 +128,15 @@ def _git(*args, timeout: int = 60):
 
 
 def push_state_now(message: str):
-    """Commit and push the state file immediately. Never raises."""
+    """Commit and push the state files immediately. Never raises."""
     if not GIT_PUSH_STATE:
         return
     try:
         _git("config", "user.name",  "github-actions[bot]")
         _git("config", "user.email", "github-actions[bot]@users.noreply.github.com")
-        _git("add", STATE_FILE)
+        for f in (STATE_FILE, LI_STATE_FILE):
+            if os.path.exists(f):
+                _git("add", f)
         if _git("diff", "--cached", "--quiet").returncode == 0:
             return  # nothing changed
         _git("commit", "-m", f"{message} [skip ci]")
@@ -327,11 +340,65 @@ def post_to_facebook(message: str, link: str) -> tuple:
     return None, "retry"
 
 
+# ── LinkedIn ─────────────────────────────────────────────────────────────────
+def post_to_linkedin(message: str, link: str, title: str) -> tuple:
+    """Returns (li_post_id | None, status) where status is 'ok' | 'retry' | 'rate_limit' | 'bad_token'."""
+    headers = {
+        "Authorization": f"Bearer {LI_TOKEN}",
+        "X-Restli-Protocol-Version": "2.0.0",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "author": LI_AUTHOR_URN,
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": message},
+                "shareMediaCategory": "ARTICLE",
+                "media": [{
+                    "status": "READY",
+                    "originalUrl": link,
+                    "title": {"text": title[:200]},
+                }],
+            }
+        },
+        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(LI_ENDPOINT, headers=headers, json=payload, timeout=30)
+            if r.status_code in (200, 201):
+                post_id = r.headers.get("x-restli-id", "")
+                if not post_id and r.content:
+                    try:
+                        post_id = r.json().get("id", "")
+                    except Exception:
+                        pass
+                return post_id or "ok", "ok"
+            log.error(f"LinkedIn error (attempt {attempt+1}) HTTP {r.status_code}: {r.text[:300]}")
+            if r.status_code == 401:
+                return None, "bad_token"
+            if r.status_code == 429:
+                return None, "rate_limit"
+            if 400 <= r.status_code < 500:
+                return None, "retry"  # 403 scope problem / 422 duplicate etc. — retrying won't help
+        except Exception as e:
+            log.error(f"LinkedIn request failed (attempt {attempt+1}): {e}")
+        time.sleep(3 * 2 ** attempt)
+    return None, "retry"
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main() -> int:
-    if not (FB_PAGE_ID and FB_PAGE_TOKEN):
-        log.error("FB_PAGE_ID / FB_PAGE_ACCESS_TOKEN not set — nothing posted.")
+    fb_on = bool(FB_PAGE_ID and FB_PAGE_TOKEN)
+    li_on = bool(LI_TOKEN and LI_AUTHOR_URN)
+    if not (fb_on or li_on):
+        log.error("No platform configured (FB_PAGE_ID/FB_PAGE_ACCESS_TOKEN or LI_ACCESS_TOKEN/LI_AUTHOR_URN) — nothing posted.")
         return 1
+    if not fb_on:
+        log.warning("Facebook not configured — skipping Facebook.")
+    if not li_on:
+        log.warning("LinkedIn not configured — skipping LinkedIn.")
 
     try:
         rows = load_rows()
@@ -340,8 +407,15 @@ def main() -> int:
         return 1
 
     cutoff = datetime.now() - timedelta(days=FB_MAX_AGE_DAYS)
-    done_ids, done_paths = load_state()
-    log.info(f"State loaded: {len(done_ids)} job(s) already posted to Facebook ({STATE_FILE})")
+    fb_ids, fb_paths = load_state(STATE_FILE)
+    li_ids, li_paths = load_state(LI_STATE_FILE)
+    log.info(f"State loaded: {len(fb_ids)} job(s) on Facebook ({STATE_FILE}), "
+             f"{len(li_ids)} on LinkedIn ({LI_STATE_FILE})")
+
+    def pending(job_id: str, path: str) -> tuple:
+        need_fb = fb_on and not ((job_id and job_id in fb_ids) or path in fb_paths)
+        need_li = li_on and not ((job_id and job_id in li_ids) or path in li_paths)
+        return need_fb, need_li
 
     todo, seen_paths = [], set()
     skipped = Counter()
@@ -352,7 +426,7 @@ def main() -> int:
             continue
         link = job_link(r)
         p = site_path(link)
-        if r.get("Job ID") in done_ids or p in done_paths:
+        if not any(pending(r.get("Job ID", ""), p)):
             skipped["already_posted"] += 1
             continue
         if p in seen_paths:
@@ -366,39 +440,66 @@ def main() -> int:
         log.info("Skipped rows by reason: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
 
     posted = 0
+    fatal = False
     for r, link, path in todo:
         if posted >= FB_MAX_POSTS_PER_RUN:
             log.info("Per-run cap reached — the rest will go out next run.")
             break
+        if not (fb_on or li_on):
+            break
         r, link = enrich_row(r, link)
         path = site_path(link)
-        if path in done_paths:
+        job_id = r.get("Job ID", "")
+        need_fb, need_li = pending(job_id, path)
+        if not (need_fb or need_li):
             log.info(f"Already posted (same page): {path}")
             continue
         if FB_REQUIRE_DETAILS and not (r.get("Short Description") and r.get("Location")):
             log.warning(f"Skipped '{r['Job Title']}': no description/location available ({path})")
             continue
         msg = build_message(r, link)
+        did_post = False
 
-        fb_id, status = post_to_facebook(msg, link)
-        if status == "ok":
-            save_state(r.get("Job ID", ""), fb_id, path)
-            done_paths.add(path)
+        if need_fb:
+            fb_id, status = post_to_facebook(msg, link)
+            if status == "ok":
+                save_state(STATE_FILE, STATE_COLS, job_id, fb_id, path)
+                fb_paths.add(path)
+                did_post = True
+                log.info(f"✅ FB posted '{r['Job Title']}' → {fb_id}  ({path})")
+                push_state_now(f"FB posted {job_id}")
+            elif status == "bad_token":
+                log.error("Facebook token invalid/expired — generate a new Page access token.")
+                fb_on, fatal = False, True
+            elif status == "rate_limit":
+                log.warning("Facebook rate limit hit — Facebook paused for this run.")
+                fb_on = False
+            else:
+                log.warning(f"FB skipped '{r['Job Title']}' this run (will retry next run).")
+
+        if need_li and li_on:
+            li_id, status = post_to_linkedin(msg, link, r["Job Title"])
+            if status == "ok":
+                save_state(LI_STATE_FILE, LI_STATE_COLS, job_id, li_id, path)
+                li_paths.add(path)
+                did_post = True
+                log.info(f"✅ LinkedIn posted '{r['Job Title']}' → {li_id}  ({path})")
+                push_state_now(f"LI posted {job_id}")
+            elif status == "bad_token":
+                log.error("LinkedIn token invalid/expired (60-day limit) — regenerate it and update LI_ACCESS_TOKEN.")
+                li_on, fatal = False, True
+            elif status == "rate_limit":
+                log.warning("LinkedIn rate limit hit — LinkedIn paused for this run.")
+                li_on = False
+            else:
+                log.warning(f"LinkedIn skipped '{r['Job Title']}' this run (will retry next run).")
+
+        if did_post:
             posted += 1
-            log.info(f"✅ posted '{r['Job Title']}' → {fb_id}  ({path})")
-            push_state_now(f"FB posted {r.get('Job ID', '')}")
             time.sleep(FB_POST_DELAY_S)
-        elif status == "bad_token":
-            log.error("Facebook token invalid/expired — generate a new Page access token.")
-            return 1
-        elif status == "rate_limit":
-            log.warning("Facebook rate limit hit — stopping; will resume next run.")
-            break
-        else:
-            log.warning(f"Skipped '{r['Job Title']}' this run (will retry next run).")
 
     log.info(f"Done. Posted {posted} job(s).")
-    return 0
+    return 1 if fatal else 0
 
 
 if __name__ == "__main__":
