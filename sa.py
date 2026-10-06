@@ -46,6 +46,8 @@ LI_ENDPOINT   = "https://api.linkedin.com/v2/ugcPosts"
 FB_POST_DELAY_S      = 45
 FB_MAX_POSTS_PER_RUN = int(os.environ.get("FB_MAX_POSTS_PER_RUN", "15") or 15)
 FB_MAX_AGE_DAYS      = int(os.environ.get("FB_MAX_AGE_DAYS", "7") or 7)
+# LinkedIn blocks unverified members that post too much, so it gets its own, lower cap
+LI_MAX_POSTS_PER_RUN = int(os.environ.get("LI_MAX_POSTS_PER_RUN", "2") or 2)
 SNIPPET_CHARS        = 220
 # 1 = only post jobs that have BOTH a short description and a location
 FB_REQUIRE_DETAILS   = os.environ.get("FB_REQUIRE_DETAILS", "1").strip() != "0"
@@ -440,6 +442,7 @@ def main() -> int:
         log.info("Skipped rows by reason: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
 
     posted = 0
+    li_posted = 0
     fatal = False
     for r, link, path in todo:
         if posted >= FB_MAX_POSTS_PER_RUN:
@@ -447,12 +450,16 @@ def main() -> int:
             break
         if not (fb_on or li_on):
             break
-        r, link = enrich_row(r, link)
-        path = site_path(link)
         job_id = r.get("Job ID", "")
         need_fb, need_li = pending(job_id, path)
+        need_li = need_li and li_posted < LI_MAX_POSTS_PER_RUN
         if not (need_fb or need_li):
-            log.info(f"Already posted (same page): {path}")
+            continue  # nothing to do, skip before fetching the page
+        r, link = enrich_row(r, link)
+        path = site_path(link)
+        need_fb, need_li = pending(job_id, path)
+        need_li = need_li and li_posted < LI_MAX_POSTS_PER_RUN
+        if not (need_fb or need_li):
             continue
         if FB_REQUIRE_DETAILS and not (r.get("Short Description") and r.get("Location")):
             log.warning(f"Skipped '{r['Job Title']}': no description/location available ({path})")
@@ -482,6 +489,7 @@ def main() -> int:
             if status == "ok":
                 save_state(LI_STATE_FILE, LI_STATE_COLS, job_id, li_id, path)
                 li_paths.add(path)
+                li_posted += 1
                 did_post = True
                 log.info(f"✅ LinkedIn posted '{r['Job Title']}' → {li_id}  ({path})")
                 push_state_now(f"LI posted {job_id}")
